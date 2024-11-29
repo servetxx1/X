@@ -111,7 +111,7 @@ def main():
 
         # API banını önlemek için 5 saniye bekleyin
         print("API banını önlemek için 5 saniye bekleniyor...")
-        time.sleep(5)
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
